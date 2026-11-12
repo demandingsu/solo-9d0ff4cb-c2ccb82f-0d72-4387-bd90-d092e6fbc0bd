@@ -57,9 +57,23 @@ ISSUES: dict[str, dict] = {
             {"id": "c9", "pages": "10", "image": True},
         ],
     },
+    "broken-image": {
+        "slug": "broken-image",
+        "issue": "2024-05-04",
+        "edition": "第3版",
+        "total_pages": 4,
+        "title": "示例 D · 坏图",
+        "description": "页码覆盖本身合格，但两个扫描图片分别返回 404 和 HTML 网页，归档包无法生成。",
+        "expected": "页码合格 · 归档失败",
+        "scans": [
+            {"id": "d1", "pages": "1", "image": True},
+            {"id": "d2", "pages": "2", "image": True, "image_bad": "404"},
+            {"id": "d3", "pages": "3-4", "image": True, "image_bad": "html"},
+        ],
+    },
 }
 
-ISSUE_ORDER = ["clean", "conflict", "pending"]
+ISSUE_ORDER = ["clean", "conflict", "pending", "broken-image"]
 PAGE_SIZE = 3
 
 
@@ -77,3 +91,10 @@ def scan_edition(scan: dict, issue: dict) -> str:
 
 def scan_image_path(slug: str, scan: dict) -> str:
     return f"/img/{slug}-{scan['id']}.svg"
+
+
+def scan_image_broken(scan: dict, issue: dict) -> str:
+    """Return "404" or "html" for deliberately broken demo images."""
+    if not isinstance(scan.get("image_bad"), str):
+        return ""
+    return scan["image_bad"]

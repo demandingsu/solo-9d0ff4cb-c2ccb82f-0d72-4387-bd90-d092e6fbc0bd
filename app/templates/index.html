@@ -46,7 +46,7 @@
     <form class="demo-card" method="post" action="/inspect">
       <input type="hidden" name="url" value="{{ item.url }}">
       <div class="demo-card-top">
-        <span class="badge badge-{{ {'合格': 'ok', '不合格': 'bad', '待核实': 'pending'}[item.expected] }}">{{ item.expected }}</span>
+        <span class="badge badge-{{ item.badge }}">{{ item.expected }}</span>
         <span class="demo-path">{{ item.url }}</span>
       </div>
       <h3>{{ item.title }}</h3>

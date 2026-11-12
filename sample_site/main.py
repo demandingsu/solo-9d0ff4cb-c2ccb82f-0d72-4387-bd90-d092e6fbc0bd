@@ -17,7 +17,15 @@ from math import ceil
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
-from .data import ISSUE_ORDER, PAGE_SIZE, get_issue, scan_edition, scan_image_path, scan_issue
+from .data import (
+    ISSUE_ORDER,
+    PAGE_SIZE,
+    get_issue,
+    scan_edition,
+    scan_image_broken,
+    scan_image_path,
+    scan_issue,
+)
 
 app = FastAPI(title="本地分页样本站点", docs_url=None, redoc_url=None)
 
@@ -239,6 +247,18 @@ async def detail(slug: str, scan_id: str) -> HTMLResponse:
 @app.get("/img/{filename}")
 async def placeholder_image(filename: str) -> Response:
     stem = filename.rsplit(".", 1)[0]
+    broken = _broken_image_kind(stem)
+    if broken == "404":
+        raise HTTPException(status_code=404, detail="扫描图片不存在")
+    if broken == "html":
+        # Simulates a misconfigured image endpoint returning a web page.
+        return HTMLResponse(
+            """<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>图片不可用</title></head>
+<body><h1>图片服务维护中</h1><p>该地址返回的是网页而不是扫描图片，请稍后重试。</p></body></html>""",
+            status_code=200,
+        )
+
     safe = html.escape(stem)
     svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="420" height="560" viewBox="0 0 420 560">
   <rect width="420" height="560" fill="#e9e2d3"/>
@@ -255,6 +275,18 @@ async def placeholder_image(filename: str) -> Response:
   <text x="210" y="512" font-family="serif" font-size="16" fill="#645d51" text-anchor="middle">{safe}</text>
 </svg>"""
     return Response(content=svg, media_type="image/svg+xml")
+
+
+def _broken_image_kind(stem: str) -> str:
+    """Match a ``{slug}-{scan_id}`` image stem against the demo data."""
+    for slug in ISSUE_ORDER:
+        issue = get_issue(slug)
+        if issue is None:
+            continue
+        for scan in issue["scans"]:
+            if stem == f"{slug}-{scan['id']}":
+                return scan_image_broken(scan, issue)
+    return ""
 
 
 @app.get("/healthz")

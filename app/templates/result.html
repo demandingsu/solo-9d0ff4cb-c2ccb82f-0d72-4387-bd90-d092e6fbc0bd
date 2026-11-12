@@ -21,6 +21,75 @@
   {% endif %}
 </div>
 
+{% if archive_error %}
+<div class="alert alert-pending">
+  <strong>未生成归档包：</strong>{{ archive_error }}
+</div>
+{% endif %}
+
+{% if archive_failures %}
+<div class="alert alert-bad">
+  <strong>归档未生成：</strong>以下扫描图片请求失败或返回的不是图片内容，需修复后重试。
+  <span class="alert-tail">页码覆盖判定仍单独有效，见下方“逐页判定与扫描来源”。</span>
+</div>
+{% endif %}
+
+<section class="section archive-section">
+  <div class="section-heading">
+    <h2>归档包下载</h2>
+    <p>只有目录、详情均完整读取且页码覆盖合格时，才会获取扫描图片并打包。</p>
+  </div>
+  {% if report.status_key == 'ok' and not archive_failures %}
+  <div class="archive-panel">
+    <p>
+      该期页码覆盖合格，可将有效扫描图片与清单
+      <code>manifest.csv</code> 打包为 ZIP。
+      同一跨页详情只存一份图片；清单记录期号、版次、页码、详情地址与包内文件名。
+    </p>
+    <form method="post" action="/archive">
+      <input type="hidden" name="url" value="{{ report.directory_url }}">
+      <button class="primary" type="submit">下载归档包（ZIP）</button>
+    </form>
+    <p class="field-hint">打包时图片逐块写入磁盘，不会把全部图片载入内存。</p>
+  </div>
+  {% elif archive_failures %}
+  <div class="archive-panel archive-panel-failed">
+    <p>图片获取失败，未生成归档包。失败来源见下方“归档图片失败来源”，原有页码判定不受影响。</p>
+    <form method="post" action="/archive">
+      <input type="hidden" name="url" value="{{ report.directory_url }}">
+      <button class="ghost" type="submit">重新尝试打包</button>
+    </form>
+  </div>
+  {% else %}
+  <div class="archive-panel archive-panel-disabled">
+    <p>该期判定为 <strong>{{ report.status }}</strong>，不满足“目录、详情完整读取且页码覆盖合格”，因此不会获取扫描图片，也不能下载归档包。</p>
+  </div>
+  {% endif %}
+</section>
+
+{% if archive_failures %}
+<section class="section">
+  <div class="section-heading">
+    <h2>归档图片失败来源</h2>
+    <p>图片请求失败或返回非图片内容时，不给出归档包。</p>
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>详情页</th><th>图片地址</th><th>失败原因</th></tr></thead>
+      <tbody>
+      {% for failure in archive_failures %}
+        <tr>
+          <td><a href="{{ failure.detail_url }}" target="_blank" rel="noopener">查看详情 ↗</a></td>
+          <td class="url-text">{{ failure.image_url }}</td>
+          <td class="muted">{{ failure.message }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endif %}
+
 <section class="stats">
   <div class="stat">
     <span class="stat-label">总页数</span>

@@ -13,10 +13,16 @@ fetch makes the whole issue "needs verification" (待核实).
 from __future__ import annotations
 
 import asyncio
+import csv
+import io
 import re
+import shutil
+import tempfile
 import unicodedata
+import zipfile
 from collections import deque
 from dataclasses import dataclass, field
+from pathlib import Path
 from urllib.parse import urldefrag, urljoin, urlparse
 
 import httpx
@@ -28,6 +34,11 @@ MAX_DIRECTORY_PAGES = 100
 MAX_DETAIL_PAGES = 2000
 MAX_PAGES_PER_SCAN = 300
 DETAIL_CONCURRENCY = 8
+
+ARCHIVE_MANIFEST_NAME = "manifest.csv"
+ARCHIVE_SCAN_DIR = "scans"
+ARCHIVE_CHUNK_SIZE = 64 * 1024
+ARCHIVE_MANIFEST_FIELDS = ("期号", "版次", "页码", "详情地址", "包内文件名")
 
 PAGINATION_MARKERS = (
     "pagination",
@@ -60,6 +71,10 @@ class InvalidDirectoryUrl(ValueError):
 
 class DirectoryUnavailable(RuntimeError):
     """The first directory page could not be read or identified."""
+
+
+class ArchiveUnavailable(RuntimeError):
+    """The issue is not qualified, so no archive package may be produced."""
 
 
 # ---------------------------------------------------------------------------
@@ -598,6 +613,7 @@ class IssueReport:
     failures: list[FetchFailure]
     directory_pages: list[str]
     warnings: list[str] = field(default_factory=list)
+    read_complete: bool = True
 
     @property
     def status(self) -> str:
@@ -688,7 +704,7 @@ def _parse_total(value: str) -> int:
 
 async def _load_directory(
     client: httpx.AsyncClient, start_url: str
-) -> tuple[DirectoryMetadata, list[str], list[str], list[FetchFailure], list[str]]:
+) -> tuple[DirectoryMetadata, list[str], list[str], list[FetchFailure], list[str], bool]:
     start = urldefrag(start_url)[0]
     queue: deque[str] = deque([start])
     visited: set[str] = set()
@@ -698,6 +714,7 @@ async def _load_directory(
     directory_pages: list[str] = []
     failures: list[FetchFailure] = []
     warnings: list[str] = []
+    read_complete = True
 
     while queue and len(visited) < MAX_DIRECTORY_PAGES:
         page_url = queue.popleft()
@@ -756,6 +773,7 @@ async def _load_directory(
         raise DirectoryUnavailable("没有读到任何目录页。")
     if len(visited) >= MAX_DIRECTORY_PAGES and queue:
         warnings.append(f"目录分页超过 {MAX_DIRECTORY_PAGES} 页，已停止继续读取。")
+        read_complete = False
     if not detail_urls:
         warnings.append("目录中未发现扫描详情链接。")
 
@@ -764,7 +782,7 @@ async def _load_directory(
         edition=metadata_parts.get("edition", ""),
         total_pages_text=metadata_parts.get("total", ""),
     )
-    return metadata, detail_urls, directory_pages, failures, warnings
+    return metadata, detail_urls, directory_pages, failures, warnings, read_complete
 
 
 async def _inspect_detail(
@@ -796,9 +814,14 @@ async def inspect_issue(directory_url: str, client: httpx.AsyncClient | None = N
         client = make_client()
 
     try:
-        metadata, detail_urls, directory_pages, dir_failures, warnings = await _load_directory(
-            client, directory_url
-        )
+        (
+            metadata,
+            detail_urls,
+            directory_pages,
+            dir_failures,
+            warnings,
+            read_complete,
+        ) = await _load_directory(client, directory_url)
 
         total_pages = _parse_total(metadata.total_pages_text)
         if not metadata.issue:
@@ -809,9 +832,10 @@ async def inspect_issue(directory_url: str, client: httpx.AsyncClient | None = N
             raise DirectoryUnavailable("目录没有给出有效的总页数，无法验收。")
 
         semaphore = asyncio.Semaphore(DETAIL_CONCURRENCY)
-        detail_urls = detail_urls[:MAX_DETAIL_PAGES]
-        if len(detail_urls) == MAX_DETAIL_PAGES:
+        if len(detail_urls) > MAX_DETAIL_PAGES:
             warnings.append(f"详情数量超过上限，仅检查前 {MAX_DETAIL_PAGES} 个。")
+            read_complete = False
+        detail_urls = detail_urls[:MAX_DETAIL_PAGES]
         results = await asyncio.gather(
             *[_inspect_detail(client, url, semaphore) for url in detail_urls]
         )
@@ -944,4 +968,312 @@ async def inspect_issue(directory_url: str, client: httpx.AsyncClient | None = N
         failures=failures,
         directory_pages=directory_pages,
         warnings=warnings,
+        read_complete=read_complete,
     )
+
+
+# ---------------------------------------------------------------------------
+# Archive package (ZIP with scan images + a CSV manifest)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ImageFailure:
+    """An accepted scan whose image could not be retrieved or was not an image."""
+
+    image_url: str
+    detail_url: str
+    message: str
+
+
+@dataclass
+class ArchiveImage:
+    """One image file inside the archive."""
+
+    scan: ScanSource
+    archive_name: str
+    content_type: str
+    size: int
+
+
+@dataclass
+class ArchivePackage:
+    """A finished ZIP on disk.  The caller owns cleanup."""
+
+    path: Path
+    filename: str
+    workdir: Path
+    images: list[ArchiveImage] = field(default_factory=list)
+    manifest_rows: list[dict[str, str]] = field(default_factory=list)
+
+    def cleanup(self) -> None:
+        shutil.rmtree(self.workdir, ignore_errors=True)
+
+
+def _media_type(content_type: str) -> str:
+    return (content_type or "").split(";", 1)[0].strip().lower()
+
+
+_IMAGE_MAGIC: dict[str, tuple[bytes, ...]] = {
+    "jpg": (b"\xff\xd8\xff",),
+    "png": (b"\x89PNG\r\n\x1a\n",),
+    "gif": (b"GIF87a", b"GIF89a"),
+    "bmp": (b"BM",),
+    "tif": (b"II*\x00", b"MM\x00*"),
+    "ico": (b"\x00\x00\x01\x00",),
+    "webp": (b"RIFF",),
+}
+_IMAGE_TYPE_EXTENSIONS = {
+    "image/jpeg": "jpg",
+    "image/jpg": "jpg",
+    "image/pjpeg": "jpg",
+    "image/png": "png",
+    "image/x-png": "png",
+    "image/gif": "gif",
+    "image/webp": "webp",
+    "image/bmp": "bmp",
+    "image/x-ms-bmp": "bmp",
+    "image/tiff": "tif",
+    "image/x-icon": "ico",
+    "image/vnd.microsoft.icon": "ico",
+    "image/svg+xml": "svg",
+}
+
+
+def _sniff_image(head: bytes) -> str:
+    """Return a file extension when the leading bytes look like an image."""
+    sample = head.lstrip(b"\xef\xbb\xbf \t\r\n")
+    lowered = sample.lower()
+    if b"<svg" in sample[:4096].lower() or (
+        lowered.startswith(b"<?xml") and b"<svg" in lowered
+    ):
+        return "svg"
+    for extension, signatures in _IMAGE_MAGIC.items():
+        if any(sample.startswith(signature) for signature in signatures):
+            if extension == "webp" and sample[8:12] != b"WEBP":
+                continue
+            return extension
+    return ""
+
+
+def _classify_image(content_type: str, head: bytes) -> tuple[str, str]:
+    """Return (extension, problem).  An empty extension means not usable."""
+    media = _media_type(content_type)
+    sniffed = _sniff_image(head)
+
+    if media in _IMAGE_TYPE_EXTENSIONS:
+        extension = _IMAGE_TYPE_EXTENSIONS[media]
+        if extension == "svg":
+            if sniffed == "svg":
+                return extension, ""
+            return "", "图片响应声明为 SVG，但内容不是 SVG 图片"
+        if sniffed == extension:
+            return extension, ""
+        # Some servers declare image/jpeg (or similar) for any raster image;
+        # trust a valid signature when the declared type is a known raster type.
+        if sniffed in _IMAGE_MAGIC:
+            return sniffed, ""
+        return "", f"图片响应内容与声明的 {media} 不符"
+
+    if media in ("", "application/octet-stream", "binary/octet-stream"):
+        if sniffed:
+            return sniffed, ""
+        return "", "图片响应没有可识别的图片内容"
+
+    if media.startswith("image/"):
+        if sniffed:
+            return sniffed, ""
+        return "", f"图片响应为未知图片类型 {media}，且内容无法识别"
+
+    return "", f"图片响应不是图片内容（Content-Type: {media or '未提供'}）"
+
+
+def _archive_filename(report: IssueReport) -> str:
+    stem = f"{report.issue_no}_{report.edition}_扫描归档"
+    stem = re.sub(r'[\\/:*?"<>|\x00-\x1f]+', "_", stem).strip(" ._") or "扫描归档"
+    return f"{stem}.zip"
+
+
+async def _download_image(
+    client: httpx.AsyncClient,
+    scan: ScanSource,
+    workdir: Path,
+    semaphore: asyncio.Semaphore,
+) -> tuple[ArchiveImage | None, ImageFailure | None]:
+    """Stream one image to disk; never hold the full body in memory."""
+    part_path = workdir / f"{scan.code}.part"
+    try:
+        async with semaphore:
+            async with client.stream(
+                "GET",
+                scan.image_url,
+                headers={"Accept": "image/*,*/*;q=0.5"},
+            ) as response:
+                if response.status_code >= 400:
+                    return None, ImageFailure(
+                        image_url=scan.image_url,
+                        detail_url=scan.detail_url,
+                        message=f"图片请求失败：HTTP {response.status_code}",
+                    )
+                content_type = response.headers.get("content-type", "")
+                head = b""
+                size = 0
+                with part_path.open("wb") as handle:
+                    async for chunk in response.aiter_bytes(ARCHIVE_CHUNK_SIZE):
+                        if not chunk:
+                            continue
+                        if len(head) < 4096:
+                            head += chunk[: 4096 - len(head)]
+                        handle.write(chunk)
+                        size += len(chunk)
+    except httpx.HTTPError as exc:
+        part_path.unlink(missing_ok=True)
+        return None, ImageFailure(
+            image_url=scan.image_url,
+            detail_url=scan.detail_url,
+            message=f"图片请求失败：{type(exc).__name__}: {exc}",
+        )
+    except OSError as exc:  # pragma: no cover - local disk failure
+        part_path.unlink(missing_ok=True)
+        return None, ImageFailure(
+            image_url=scan.image_url,
+            detail_url=scan.detail_url,
+            message=f"图片写入失败：{type(exc).__name__}: {exc}",
+        )
+
+    if size == 0:
+        part_path.unlink(missing_ok=True)
+        return None, ImageFailure(
+            image_url=scan.image_url,
+            detail_url=scan.detail_url,
+            message="图片响应为空，未返回图片内容",
+        )
+
+    extension, problem = _classify_image(content_type, head)
+    if not extension:
+        part_path.unlink(missing_ok=True)
+        return None, ImageFailure(
+            image_url=scan.image_url,
+            detail_url=scan.detail_url,
+            message=problem or "图片响应不是有效图片",
+        )
+
+    archive_name = f"{ARCHIVE_SCAN_DIR}/{scan.code}.{extension}"
+    final_path = workdir / f"{scan.code}.{extension}"
+    part_path.replace(final_path)
+    return (
+        ArchiveImage(
+            scan=scan,
+            archive_name=archive_name,
+            content_type=_media_type(content_type),
+            size=size,
+        ),
+        None,
+    )
+
+
+def _manifest_bytes(rows: list[dict[str, str]]) -> bytes:
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=list(ARCHIVE_MANIFEST_FIELDS), lineterminator="\n")
+    writer.writeheader()
+    writer.writerows(rows)
+    return buffer.getvalue().encode("utf-8")
+
+
+async def build_archive(
+    report: IssueReport,
+    client: httpx.AsyncClient | None = None,
+) -> tuple[ArchivePackage | None, list[ImageFailure]]:
+    """Build the archive for a qualified issue.
+
+    The report must already be a complete, qualified audit (all directory and
+    detail pages read, every page covered by exactly one valid scan).  Images
+    are streamed to temporary files and added to the ZIP from disk, so the
+    package never depends on holding every image in memory.
+
+    Returns ``(package, failures)``.  If any image fails, no package is
+    produced and the failure list explains each source that could not be
+    archived.
+    """
+    if report.status_key != "ok":
+        raise ArchiveUnavailable(
+            f"该期判定为{report.status}，只有页码覆盖合格时才生成归档包。"
+        )
+    if not report.read_complete:
+        raise ArchiveUnavailable(
+            "目录或详情未完整读取（达到抓取上限），不能生成归档包。"
+        )
+
+    scans: list[ScanSource] = []
+    seen_details: set[str] = set()
+    for scan in report.accepted_scans:
+        # One image per scan detail; a spread detail covers several pages but
+        # must still yield only one file in the package.
+        if scan.detail_url in seen_details:
+            continue
+        seen_details.add(scan.detail_url)
+        scans.append(scan)
+
+    own_client = client is None
+    if client is None:
+        client = make_client()
+
+    workdir = Path(tempfile.mkdtemp(prefix="scan-archive-"))
+    try:
+        semaphore = asyncio.Semaphore(DETAIL_CONCURRENCY)
+        results = await asyncio.gather(
+            *[_download_image(client, scan, workdir, semaphore) for scan in scans]
+        )
+    finally:
+        if own_client:
+            await client.aclose()
+
+    images: list[ArchiveImage] = []
+    failures: list[ImageFailure] = []
+    for image, failure in results:
+        if failure is not None:
+            failures.append(failure)
+        elif image is not None:
+            images.append(image)
+
+    if failures:
+        shutil.rmtree(workdir, ignore_errors=True)
+        return None, sorted(failures, key=lambda item: (item.detail_url, item.image_url))
+
+    images.sort(key=lambda item: item.scan.code)
+    manifest_rows = [
+        {
+            "期号": image.scan.issue,
+            "版次": image.scan.edition,
+            "页码": image.scan.pages_text
+            or "、".join(str(number) for number in image.scan.page_numbers),
+            "详情地址": image.scan.detail_url,
+            "包内文件名": image.archive_name,
+        }
+        for image in images
+    ]
+
+    filename = _archive_filename(report)
+    zip_path = workdir / filename
+    try:
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr(ARCHIVE_MANIFEST_NAME, _manifest_bytes(manifest_rows))
+            for image in images:
+                # ``write`` streams from disk in chunks; nothing is buffered
+                # in memory beyond the current block.
+                archive.write(workdir / image.archive_name.split("/", 1)[1], image.archive_name)
+    except OSError:
+        shutil.rmtree(workdir, ignore_errors=True)
+        raise
+
+    return (
+        ArchivePackage(
+            path=zip_path,
+            filename=filename,
+            workdir=workdir,
+            images=images,
+            manifest_rows=manifest_rows,
+        ),
+        [],
+    )
+

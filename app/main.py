@@ -8,13 +8,16 @@ from urllib.parse import quote, urljoin, urlparse
 
 import httpx
 from fastapi import FastAPI, Form, Request
-from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
+from starlette.background import BackgroundTask
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from .scraper import (
+    ArchiveUnavailable,
     DirectoryUnavailable,
     InvalidDirectoryUrl,
+    build_archive,
     inspect_issue,
 )
 
@@ -32,20 +35,30 @@ DEMO_ISSUES = [
     {
         "path": "/issues/clean/page/1.html",
         "title": "示例 A · 完整期",
-        "description": "6 页均由唯一有效扫描覆盖。",
+        "description": "6 页均由唯一有效扫描覆盖，可生成归档包。",
         "expected": "合格",
+        "badge": "ok",
     },
     {
         "path": "/issues/conflict/page/1.html",
         "title": "示例 B · 重扫与缺页",
         "description": "第 3 页重扫；第 4、5 页缺扫。",
         "expected": "不合格",
+        "badge": "bad",
     },
     {
         "path": "/issues/pending/page/1.html",
         "title": "示例 C · 详情 404",
         "description": "详情抓取失败，整期待核实。",
         "expected": "待核实",
+        "badge": "pending",
+    },
+    {
+        "path": "/issues/broken-image/page/1.html",
+        "title": "示例 D · 坏图",
+        "description": "页码覆盖合格，但图片 404 / 返回网页，无法生成归档包。",
+        "expected": "页码合格 · 归档失败",
+        "badge": "bad",
     },
 ]
 
@@ -59,6 +72,7 @@ def _demo_context() -> tuple[list[dict], bool]:
             "title": item["title"],
             "description": item["description"],
             "expected": item["expected"],
+            "badge": item["badge"],
         }
         for item in DEMO_ISSUES
     ]
@@ -124,6 +138,16 @@ async def inspect(request: Request, url: str = Form("")) -> HTMLResponse:
             status_code=200,
         )
 
+    return _render_report(request, report)
+
+
+def _render_report(
+    request: Request,
+    report,
+    *,
+    archive_failures=None,
+    archive_error: str = "",
+) -> HTMLResponse:
     return templates.TemplateResponse(
         request,
         "result.html",
@@ -134,8 +158,63 @@ async def inspect(request: Request, url: str = Form("")) -> HTMLResponse:
                 "conflict": "重扫冲突",
                 "missing": "待补扫",
             },
+            "archive_failures": archive_failures or [],
+            "archive_error": archive_error,
             "sample_prefix": SAMPLE_SITE_PREFIX,
         },
+    )
+
+
+@app.post("/archive", response_class=Response)
+async def archive(request: Request, url: str = Form("")) -> Response:
+    """Re-run the audit and, only if it qualifies, stream a ZIP of scan images."""
+    return await _archive_response(request, url)
+
+
+@app.get("/archive", response_class=Response)
+async def archive_get(request: Request, url: str = "") -> Response:
+    """Convenience alias for the download form (same rules as POST)."""
+    return await _archive_response(request, url)
+
+
+async def _archive_response(request: Request, url: str) -> Response:
+    try:
+        directory_url = _resolve_input(url, request)
+    except InvalidDirectoryUrl as exc:
+        return _render_index(request, url=url, error=str(exc), status_code=400)
+
+    try:
+        report = await inspect_issue(directory_url)
+    except InvalidDirectoryUrl as exc:
+        return _render_index(request, url=url, error=str(exc), status_code=400)
+    except DirectoryUnavailable as exc:
+        return templates.TemplateResponse(
+            request,
+            "error.html",
+            {"url": directory_url, "message": str(exc), "sample_prefix": SAMPLE_SITE_PREFIX},
+            status_code=200,
+        )
+
+    if report.status_key != "ok":
+        return _render_report(
+            request,
+            report,
+            archive_error=f"该期判定为{report.status}，未读取扫描图片，不能生成归档包。",
+        )
+
+    try:
+        package, image_failures = await build_archive(report)
+    except ArchiveUnavailable as exc:
+        return _render_report(request, report, archive_error=str(exc))
+
+    if package is None:
+        return _render_report(request, report, archive_failures=image_failures)
+
+    return FileResponse(
+        package.path,
+        media_type="application/zip",
+        filename=package.filename,
+        background=BackgroundTask(package.cleanup),
     )
 
 
